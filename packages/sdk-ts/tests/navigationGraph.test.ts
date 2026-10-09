@@ -14,12 +14,21 @@ const screens = {
 const toLogin: Action = { selector: "#login", description: "Open login", method: "click" };
 const toHome: Action = { selector: "#back", description: "Go back home", method: "click" };
 
-/** A page whose state changes only through deterministic actions; string instructions mean inference. */
+/**
+ * A page whose state changes only through deterministic actions and URLs, both
+ * looked up in `transitions`; string instructions mean inference.
+ */
 function fakeSite(start: Screen, transitions: Map<string, Screen> = new Map()) {
   let screen = start;
   const actCalls: Action[] = [];
+  const gotoCalls: string[] = [];
   const page = {
     url: async () => screen.url,
+    goto: async (url: string) => {
+      gotoCalls.push(url);
+      screen = transitions.get(url) ?? screen;
+      return null;
+    },
     snapshot: async () => ({ formattedTree: screen.tree, xpathMap: {}, urlMap: {} }),
   } as unknown as Page;
   const stagehand = {
@@ -31,7 +40,7 @@ function fakeSite(start: Screen, transitions: Map<string, Screen> = new Map()) {
       return actResult(next !== undefined, next ? [instruction] : []);
     },
   };
-  return { page, stagehand, actCalls, show: (next: Screen) => (screen = next) };
+  return { page, stagehand, actCalls, gotoCalls, show: (next: Screen) => (screen = next) };
 }
 
 function actResult(success: boolean, actions: Action[]): ActResult {
@@ -141,7 +150,9 @@ describe("experimental navigation graph", () => {
       result: actResult(true, [toHome]),
     });
 
-    expect(nav.findPath(graph, login, home)?.map((edge) => edge.actions)).toEqual([[toHome]]);
+    expect(nav.findPath(graph, login, home)).toEqual([
+      { from: login, to: home, actions: [toHome] },
+    ]);
     expect(nav.findPath(graph, home, home)).toEqual([]);
     expect(nav.findPath(nav.create(), home, login)).toBeUndefined();
   });
@@ -179,6 +190,64 @@ describe("experimental navigation graph", () => {
     });
     await expect(nav.replay(graph, { ...wrongTarget, path: [] })).resolves.toEqual({
       status: "completed",
+    });
+  });
+
+  it("R6: trusts a URL only after it led to the same state twice", async () => {
+    const site = fakeSite(screens.home);
+    const graph = nav.create();
+    await nav.recordState(graph, site.page);
+    site.show(screens.login);
+    await nav.recordState(graph, site.page);
+    await nav.recordState(graph, site.page);
+    site.show(screens.menu);
+    await nav.recordState(graph, site.page);
+
+    expect(graph.urls).toEqual([
+      { url: "https://shop.test/", nodeId: null, hits: 2 },
+      { url: screens.login.url, nodeId: "node-1", hits: 2 },
+    ]);
+    expect(nav.fromJSON('{"nodes":[],"edges":[]}')).toEqual(nav.create());
+  });
+
+  it("R6: prefers a shortcut that replaces at least GOTO_COST clicks", () => {
+    const edge = (from: string, to: string, action: Action) => ({ from, to, actions: [action] });
+    const graph: nav.NavigationGraph = {
+      ...nav.create(),
+      edges: [edge("home", "login", toLogin), edge("login", "account", toHome)],
+      urls: [
+        { url: "https://shop.test/login", nodeId: "login", hits: 2 },
+        { url: "https://shop.test/account", nodeId: "account", hits: 2 },
+        { url: "https://shop.test/cart", nodeId: "cart", hits: 1 },
+        { url: "https://shop.test/", nodeId: null, hits: 3 },
+      ],
+    };
+
+    expect(nav.findPath(graph, "home", "account")).toEqual([
+      { to: "account", url: "https://shop.test/account" },
+    ]);
+    expect(nav.findPath(graph, "home", "login")).toEqual([graph.edges[0]]);
+    expect(nav.findPath(graph, "home", "cart")).toBeUndefined();
+  });
+
+  it("R6: replays a shortcut with page.goto() from any state", async () => {
+    const recorder = fakeSite(screens.login);
+    const graph = nav.create();
+    await nav.recordState(graph, recorder.page);
+    await nav.recordState(graph, recorder.page);
+    const path = nav.findPath(graph, "anywhere", "node-0")!;
+    const site = fakeSite(screens.menu, new Map([[screens.login.url, screens.login]]));
+
+    await expect(nav.replay(graph, { ...site, path })).resolves.toEqual({ status: "completed" });
+    expect(site.gotoCalls).toEqual([screens.login.url]);
+    expect(site.actCalls).toEqual([]);
+
+    const loginWall = fakeSite(screens.menu, new Map([[screens.login.url, screens.home]]));
+    await expect(nav.replay(graph, { ...loginWall, path })).resolves.toEqual({
+      status: "diverged",
+      step: 1,
+      expectedNodeId: "node-0",
+      actual: { status: "unknown" },
     });
   });
 });

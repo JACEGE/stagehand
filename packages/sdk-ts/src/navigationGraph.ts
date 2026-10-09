@@ -11,6 +11,16 @@ import type { Stagehand } from "./stagehand.js";
  */
 export const STATE_MATCH_THRESHOLD = 0.95;
 
+/**
+ * Path cost of one `page.goto()`, counted in clicks. A URL shortcut replaces a
+ * path of this many clicks or more; on a tie it wins, because a stored URL does
+ * not depend on where a link is placed on the page.
+ */
+export const GOTO_COST = 2;
+
+/** Times a URL must have led to the same state before replay may `goto` it. */
+export const SHORTCUT_MIN_HITS = 2;
+
 const NavigationNodeSchema = z.strictObject({
   id: z.string(),
   url: z.string(),
@@ -24,14 +34,24 @@ const NavigationEdgeSchema = z.strictObject({
   actions: z.array(ActionSchema).min(1),
 });
 
+/** A URL seen at a recorded state; `nodeId` is null once it was seen at different states. */
+const NavigationUrlSchema = z.strictObject({
+  url: z.string(),
+  nodeId: z.string().nullable(),
+  hits: z.number().int().positive(),
+});
+
 const NavigationGraphSchema = z.strictObject({
   nodes: z.array(NavigationNodeSchema),
   edges: z.array(NavigationEdgeSchema),
+  urls: z.array(NavigationUrlSchema).default([]),
 });
 
 export type NavigationNode = z.infer<typeof NavigationNodeSchema>;
 export type NavigationEdge = z.infer<typeof NavigationEdgeSchema>;
 export type NavigationGraph = z.infer<typeof NavigationGraphSchema>;
+export type NavigationGoto = { to: string; url: string };
+export type NavigationStep = NavigationEdge | NavigationGoto;
 
 export type StateRecognition =
   | { status: "matched"; nodeId: string }
@@ -46,7 +66,7 @@ export type ReplayResult =
 type StateObservation = Pick<NavigationNode, "url" | "fingerprint">;
 
 export function create(): NavigationGraph {
-  return { nodes: [], edges: [] };
+  return { nodes: [], edges: [], urls: [] };
 }
 
 export function toJSON(graph: NavigationGraph): string {
@@ -65,14 +85,17 @@ export async function recognize(graph: NavigationGraph, page: Page): Promise<Sta
   return matchState(graph, await observeState(page));
 }
 
-/** Recognizes the current page, adding it as a new node when it is unknown. */
+/**
+ * Recognizes the current page, adding it as a new node when it is unknown, and
+ * counts the page URL as one observation of a shortcut to that node.
+ */
 export async function recordState(graph: NavigationGraph, page: Page): Promise<StateRecognition> {
   const state = await observeState(page);
   const recognition = matchState(graph, state);
-  if (recognition.status !== "unknown") return recognition;
-  const node = { id: `node-${graph.nodes.length}`, ...state, frontier: [] };
-  graph.nodes.push(node);
-  return { status: "matched", nodeId: node.id };
+  if (recognition.status === "ambiguous") return recognition;
+  const nodeId = recognition.status === "matched" ? recognition.nodeId : addNode(graph, state);
+  recordUrl(graph, { url: state.url, nodeId });
+  return { status: "matched", nodeId };
 }
 
 /** Records a successful `act()` as an edge from `from` to the state the page reached. */
@@ -111,12 +134,31 @@ export function recordObserve(
   }
 }
 
-/** Shortest path by edge count (BFS), or `undefined` when `to` is unreachable. */
+/**
+ * Cheapest path, counting each edge as one click and a trusted URL shortcut as
+ * `GOTO_COST`, or `undefined` when `to` is unreachable. A shortcut works from
+ * any state, so the cheapest path uses at most one, as its first step.
+ */
 export function findPath(
   graph: NavigationGraph,
   from: string,
   to: string,
-): NavigationEdge[] | undefined {
+): NavigationStep[] | undefined {
+  const shortcuts = graph.urls.flatMap(({ url, nodeId, hits }) => {
+    if (nodeId === null || hits < SHORTCUT_MIN_HITS) return [];
+    const rest = edgePath(graph, nodeId, to);
+    return rest ? [[{ to: nodeId, url }, ...rest]] : [];
+  });
+  const direct = edgePath(graph, from, to);
+  const candidates: NavigationStep[][] = direct ? [...shortcuts, direct] : shortcuts;
+  return candidates.reduce<NavigationStep[] | undefined>(
+    (best, path) => (best && pathCost(best) <= pathCost(path) ? best : path),
+    undefined,
+  );
+}
+
+/** Shortest path over recorded edges by edge count (BFS). */
+function edgePath(graph: NavigationGraph, from: string, to: string): NavigationEdge[] | undefined {
   const reachedBy = new Map<string, NavigationEdge | undefined>([[from, undefined]]);
   const queue = [from];
   for (const nodeId of queue) {
@@ -130,16 +172,23 @@ export function findPath(
   return undefined;
 }
 
-/** Replays `path` through `act(action)` only, stopping as soon as the page leaves it. */
+/**
+ * Replays `path` through `act(action)` and `page.goto(url)` only, stopping as
+ * soon as the page leaves it.
+ */
 export async function replay(
   graph: NavigationGraph,
   {
     stagehand,
     page,
     path,
-  }: { stagehand: Pick<Stagehand, "act">; page: Page; path: NavigationEdge[] },
+  }: { stagehand: Pick<Stagehand, "act">; page: Page; path: NavigationStep[] },
 ): Promise<ReplayResult> {
   for (const [step, edge] of path.entries()) {
+    if ("url" in edge) {
+      await page.goto(edge.url);
+      continue;
+    }
     const divergence = await checkState(graph, page, { step, expectedNodeId: edge.from });
     if (divergence) return divergence;
     for (const action of edge.actions) {
@@ -198,6 +247,26 @@ function similarity(known: string[], current: string[]): number {
   const shared = current.filter((line) => knownLines.has(line)).length;
   const union = knownLines.size + current.length - shared;
   return union === 0 ? 1 : shared / union;
+}
+
+function addNode(graph: NavigationGraph, state: StateObservation): string {
+  const id = `node-${graph.nodes.length}`;
+  graph.nodes.push({ id, ...state, frontier: [] });
+  return id;
+}
+
+function recordUrl(graph: NavigationGraph, { url, nodeId }: { url: string; nodeId: string }): void {
+  const known = graph.urls.find((entry) => entry.url === url);
+  if (!known) {
+    graph.urls.push({ url, nodeId, hits: 1 });
+    return;
+  }
+  known.hits += 1;
+  if (known.nodeId !== nodeId) known.nodeId = null;
+}
+
+function pathCost(path: NavigationStep[]): number {
+  return path.reduce((cost, step) => cost + ("url" in step ? GOTO_COST : 1), 0);
 }
 
 function unwindPath(
