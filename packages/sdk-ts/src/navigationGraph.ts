@@ -63,9 +63,20 @@ export type ReplayResult =
   | { status: "diverged"; step: number; expectedNodeId: string; actual: StateRecognition }
   | { status: "failed"; step: number; message: string };
 
+export type NavigateResult =
+  | ReplayResult
+  | { status: "lost"; current: StateRecognition }
+  | { status: "unreachable" };
+
+export type TryResult =
+  | { status: "lost"; current: StateRecognition }
+  | { status: "not_in_frontier"; nodeId: string }
+  | { status: "tried"; success: boolean; reached: StateRecognition };
+
 type StateObservation = Pick<NavigationNode, "url" | "fingerprint">;
 
 type ReplayParams = { stagehand: Pick<Stagehand, "act">; page: Page; path: NavigationStep[] };
+type ActParams = Omit<ReplayParams, "path">;
 
 /** Runs one edge's actions, returning a failure message or `undefined`. */
 type EdgeRunner = (
@@ -200,6 +211,50 @@ export async function replayWithHealing(
   params: ReplayParams,
 ): Promise<ReplayResult> {
   return replaySteps(graph, params, healEdge);
+}
+
+/** Replays the shortest recorded path from the current state to `to`, without inference. */
+export async function navigateTo(
+  graph: NavigationGraph,
+  { stagehand, page, to }: ActParams & { to: string },
+): Promise<NavigateResult> {
+  const current = await recognize(graph, page);
+  if (current.status !== "matched") return { status: "lost", current };
+  const path = findPath(graph, current.nodeId, to);
+  return path ? replay(graph, { stagehand, page, path }) : { status: "unreachable" };
+}
+
+/** Records the current state and adds what `stagehand.observe()` finds there to its frontier. */
+export async function observeFrontier(
+  graph: NavigationGraph,
+  { stagehand, page }: { stagehand: Pick<Stagehand, "observe">; page: Page },
+): Promise<StateRecognition> {
+  const current = await recordState(graph, page);
+  if (current.status !== "matched") return current;
+  recordObserve(graph, {
+    nodeId: current.nodeId,
+    result: await stagehand.observe(undefined, { page }),
+  });
+  return current;
+}
+
+/**
+ * Runs one frontier action of the current state and records where it leads.
+ * The action leaves the frontier even when it fails, so it is never retried.
+ */
+export async function tryFrontierAction(
+  graph: NavigationGraph,
+  { stagehand, page, action }: ActParams & { action: Action },
+): Promise<TryResult> {
+  const current = await recognize(graph, page);
+  if (current.status !== "matched") return { status: "lost", current };
+  const node = getNode(graph, current.nodeId);
+  const index = node.frontier.findIndex((known) => actionKey(known) === actionKey(action));
+  if (index === -1) return { status: "not_in_frontier", nodeId: node.id };
+  node.frontier.splice(index, 1);
+  const result = await stagehand.act(action, { page });
+  const reached = await recordAct(graph, { page, from: node.id, result });
+  return { status: "tried", success: result.data.success, reached };
 }
 
 async function replaySteps(

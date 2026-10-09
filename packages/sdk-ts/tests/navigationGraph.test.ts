@@ -13,6 +13,10 @@ const screens = {
 } satisfies Record<string, Screen>;
 const toLogin: Action = { selector: "#login", description: "Open login", method: "click" };
 const toHome: Action = { selector: "#back", description: "Go back home", method: "click" };
+const observable = new Map<string, Action[]>([
+  [screens.home.url, [toLogin]],
+  [screens.login.url, [toHome]],
+]);
 
 /**
  * A page whose state changes only through deterministic actions and URLs, both
@@ -53,6 +57,7 @@ function fakeSite(
       inferenceCalls.push(instruction);
       return perform(healed);
     },
+    observe: async () => observeResult(observable.get(screen.url) ?? []),
   };
   const show = (next: Screen) => (screen = next);
   return { page, stagehand, actCalls, gotoCalls, inferenceCalls, show };
@@ -332,6 +337,60 @@ describe("experimental navigation graph", () => {
     });
     graph.edges[0]!.actions = [{ ...toLogin, selector: "#gone" }];
     await expect(nav.replay(graph, { ...site, path })).resolves.toMatchObject({ status: "failed" });
+    expect(site.inferenceCalls).toEqual([]);
+  });
+
+  it("R8: lets an agent observe and try frontier actions", async () => {
+    const graph = nav.create();
+    const site = fakeSite(screens.home, new Map([[toLogin.selector, screens.login]]));
+
+    await expect(nav.observeFrontier(graph, site)).resolves.toEqual({
+      status: "matched",
+      nodeId: "node-0",
+    });
+    expect(nav.frontier(graph, "node-0")).toEqual([toLogin]);
+    await expect(nav.tryFrontierAction(graph, { ...site, action: toHome })).resolves.toEqual({
+      status: "not_in_frontier",
+      nodeId: "node-0",
+    });
+    await expect(nav.tryFrontierAction(graph, { ...site, action: toLogin })).resolves.toEqual({
+      status: "tried",
+      success: true,
+      reached: { status: "matched", nodeId: "node-1" },
+    });
+    expect(nav.frontier(graph, "node-0")).toEqual([]);
+
+    await nav.observeFrontier(graph, site);
+    await expect(nav.tryFrontierAction(graph, { ...site, action: toHome })).resolves.toMatchObject({
+      status: "tried",
+      success: false,
+    });
+    expect(nav.frontier(graph, "node-1")).toEqual([]);
+    expect(site.inferenceCalls).toEqual([]);
+  });
+
+  it("R8: navigates to known states and reports lost or unreachable", async () => {
+    const { graph, home, login } = await homeLoginGraph();
+    const site = fakeSite(screens.home, new Map([[toLogin.selector, screens.login]]));
+
+    await expect(nav.navigateTo(graph, { ...site, to: login })).resolves.toEqual({
+      status: "completed",
+    });
+    await expect(nav.navigateTo(graph, { ...site, to: home })).resolves.toEqual({
+      status: "unreachable",
+    });
+    site.show(screens.menu);
+    await expect(nav.navigateTo(graph, { ...site, to: home })).resolves.toMatchObject({
+      status: "lost",
+    });
+    await expect(nav.tryFrontierAction(graph, { ...site, action: toLogin })).resolves.toMatchObject(
+      {
+        status: "lost",
+      },
+    );
+    await nav.observeFrontier(graph, site);
+    graph.nodes.push({ ...graph.nodes.at(-1)!, id: "copy" });
+    await expect(nav.observeFrontier(graph, site)).resolves.toMatchObject({ status: "ambiguous" });
     expect(site.inferenceCalls).toEqual([]);
   });
 });
