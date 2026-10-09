@@ -16,12 +16,23 @@ const toHome: Action = { selector: "#back", description: "Go back home", method:
 
 /**
  * A page whose state changes only through deterministic actions and URLs, both
- * looked up in `transitions`; string instructions mean inference.
+ * looked up in `transitions`. A string instruction is inference: it resolves to
+ * the action in `healing` and throws when there is none.
  */
-function fakeSite(start: Screen, transitions: Map<string, Screen> = new Map()) {
+function fakeSite(
+  start: Screen,
+  transitions: Map<string, Screen> = new Map(),
+  healing: Map<string, Action> = new Map(),
+) {
   let screen = start;
   const actCalls: Action[] = [];
   const gotoCalls: string[] = [];
+  const inferenceCalls: string[] = [];
+  const perform = (action: Action) => {
+    const next = transitions.get(action.selector);
+    if (next) screen = next;
+    return actResult(next !== undefined, next ? [action] : []);
+  };
   const page = {
     url: async () => screen.url,
     goto: async (url: string) => {
@@ -33,14 +44,18 @@ function fakeSite(start: Screen, transitions: Map<string, Screen> = new Map()) {
   } as unknown as Page;
   const stagehand = {
     act: async (instruction: string | Action): Promise<ActResult> => {
-      if (typeof instruction === "string") throw new Error("inference is not allowed in replay");
-      actCalls.push(instruction);
-      const next = transitions.get(instruction.selector);
-      if (next) screen = next;
-      return actResult(next !== undefined, next ? [instruction] : []);
+      if (typeof instruction !== "string") {
+        actCalls.push(instruction);
+        return perform(instruction);
+      }
+      const healed = healing.get(instruction);
+      if (!healed) throw new Error("inference is not allowed in replay");
+      inferenceCalls.push(instruction);
+      return perform(healed);
     },
   };
-  return { page, stagehand, actCalls, gotoCalls, show: (next: Screen) => (screen = next) };
+  const show = (next: Screen) => (screen = next);
+  return { page, stagehand, actCalls, gotoCalls, inferenceCalls, show };
 }
 
 function actResult(success: boolean, actions: Action[]): ActResult {
@@ -249,5 +264,74 @@ describe("experimental navigation graph", () => {
       expectedNodeId: "node-0",
       actual: { status: "unknown" },
     });
+  });
+
+  it("R7: heals a broken selector once and stores the healed action", async () => {
+    const { graph, home, login } = await homeLoginGraph();
+    const path = nav.findPath(graph, home, login)!;
+    const movedLogin = { ...toLogin, selector: "#login-v2" };
+    const transitions = new Map([[movedLogin.selector, screens.login]]);
+    const site = fakeSite(screens.home, transitions, new Map([[toLogin.description, movedLogin]]));
+
+    await expect(nav.replayWithHealing(graph, { ...site, path })).resolves.toEqual({
+      status: "completed",
+    });
+    expect(site.inferenceCalls).toEqual([toLogin.description]);
+    expect(graph.edges[0]?.actions).toEqual([movedLogin]);
+
+    const nextRun = fakeSite(screens.home, transitions);
+    await expect(nav.replayWithHealing(graph, { ...nextRun, path })).resolves.toEqual({
+      status: "completed",
+    });
+    expect(nextRun.inferenceCalls).toEqual([]);
+  });
+
+  it("R7: keeps the edge when the healed action reaches another state", async () => {
+    const { graph, home, login } = await homeLoginGraph();
+    const path = nav.findPath(graph, home, login)!;
+    const wrongLink = { ...toLogin, selector: "#menu" };
+    const site = fakeSite(
+      screens.home,
+      new Map([[wrongLink.selector, screens.menu]]),
+      new Map([[toLogin.description, wrongLink]]),
+    );
+
+    await expect(nav.replayWithHealing(graph, { ...site, path })).resolves.toMatchObject({
+      status: "diverged",
+      step: 1,
+    });
+    expect(graph.edges[0]?.actions).toEqual([toLogin]);
+
+    const stillBroken = { ...toLogin, selector: "#still-gone" };
+    const unhealed = fakeSite(
+      screens.home,
+      new Map(),
+      new Map([[toLogin.description, stillBroken]]),
+    );
+    await expect(nav.replayWithHealing(graph, { ...unhealed, path })).resolves.toMatchObject({
+      status: "failed",
+      step: 0,
+    });
+  });
+
+  it("R7: never sends actions with arguments or plain replays to inference", async () => {
+    const { graph, home, login } = await homeLoginGraph();
+    const typeEmail = {
+      ...toLogin,
+      selector: "#email",
+      method: "fill",
+      arguments: ["jannis@example.test"],
+    };
+    graph.edges[0]!.actions = [typeEmail];
+    const path = nav.findPath(graph, home, login)!;
+    const healing = new Map([[typeEmail.description, toLogin]]);
+    const site = fakeSite(screens.home, new Map([[toLogin.selector, screens.login]]), healing);
+
+    await expect(nav.replayWithHealing(graph, { ...site, path })).resolves.toMatchObject({
+      status: "failed",
+    });
+    graph.edges[0]!.actions = [{ ...toLogin, selector: "#gone" }];
+    await expect(nav.replay(graph, { ...site, path })).resolves.toMatchObject({ status: "failed" });
+    expect(site.inferenceCalls).toEqual([]);
   });
 });

@@ -65,6 +65,14 @@ export type ReplayResult =
 
 type StateObservation = Pick<NavigationNode, "url" | "fingerprint">;
 
+type ReplayParams = { stagehand: Pick<Stagehand, "act">; page: Page; path: NavigationStep[] };
+
+/** Runs one edge's actions, returning a failure message or `undefined`. */
+type EdgeRunner = (
+  graph: NavigationGraph,
+  run: Omit<ReplayParams, "path"> & { edge: NavigationEdge },
+) => Promise<string | undefined>;
+
 export function create(): NavigationGraph {
   return { nodes: [], edges: [], urls: [] };
 }
@@ -176,13 +184,28 @@ function edgePath(graph: NavigationGraph, from: string, to: string): NavigationE
  * Replays `path` through `act(action)` and `page.goto(url)` only, stopping as
  * soon as the page leaves it.
  */
-export async function replay(
+export async function replay(graph: NavigationGraph, params: ReplayParams): Promise<ReplayResult> {
+  return replaySteps(graph, params, runEdge);
+}
+
+/**
+ * Like `replay`, but retries a failed action without arguments once through
+ * `act(action.description)`, which uses inference. When the page then reaches
+ * the edge's target state, the edge in `graph` keeps the healed actions, so
+ * `path` must come from `findPath(graph, ...)`. Actions with arguments are not
+ * retried, so their values never reach a prompt.
+ */
+export async function replayWithHealing(
   graph: NavigationGraph,
-  {
-    stagehand,
-    page,
-    path,
-  }: { stagehand: Pick<Stagehand, "act">; page: Page; path: NavigationStep[] },
+  params: ReplayParams,
+): Promise<ReplayResult> {
+  return replaySteps(graph, params, healEdge);
+}
+
+async function replaySteps(
+  graph: NavigationGraph,
+  { stagehand, page, path }: ReplayParams,
+  runner: EdgeRunner,
 ): Promise<ReplayResult> {
   for (const [step, edge] of path.entries()) {
     if ("url" in edge) {
@@ -191,16 +214,39 @@ export async function replay(
     }
     const divergence = await checkState(graph, page, { step, expectedNodeId: edge.from });
     if (divergence) return divergence;
-    for (const action of edge.actions) {
-      const result = await stagehand.act(action, { page });
-      if (!result.data.success) return { status: "failed", step, message: result.data.message };
-    }
+    const message = await runner(graph, { stagehand, page, edge });
+    if (message !== undefined) return { status: "failed", step, message };
   }
   const last = path.at(-1);
   if (!last) return { status: "completed" };
   const divergence = await checkState(graph, page, { step: path.length, expectedNodeId: last.to });
   return divergence ?? { status: "completed" };
 }
+
+const runEdge: EdgeRunner = async (_graph, { stagehand, page, edge }) => {
+  for (const action of edge.actions) {
+    const result = await stagehand.act(action, { page });
+    if (!result.data.success) return result.data.message;
+  }
+  return undefined;
+};
+
+const healEdge: EdgeRunner = async (graph, { stagehand, page, edge }) => {
+  const healed: Action[] = [];
+  for (const action of edge.actions) {
+    const result = await stagehand.act(action, { page });
+    const final =
+      result.data.success || action.arguments?.length
+        ? result
+        : await stagehand.act(action.description, { page });
+    if (!final.data.success) return final.data.message;
+    healed.push(...final.data.actions);
+  }
+  if (actionsKey(healed) === actionsKey(edge.actions)) return undefined;
+  const reached = await recognize(graph, page);
+  if (reached.status === "matched" && reached.nodeId === edge.to) edge.actions = healed;
+  return undefined;
+};
 
 async function checkState(
   graph: NavigationGraph,
